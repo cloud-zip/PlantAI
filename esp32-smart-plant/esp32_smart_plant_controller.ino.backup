@@ -1,0 +1,745 @@
+/*
+  Smart Plant Care Controller — ESP32 FINAL HARDWARE BUILD
+
+  Supported hardware:
+  - ESP32
+  - DHT11 temperature/humidity sensor
+  - Capacitive soil moisture sensor
+  - 16x2 I2C LCD display
+  - 5V relay module for motor/pump
+  - Soil NPK sensor through RS485-to-TTL converter
+  - Supabase upload through Edge Functions
+
+  Required Arduino libraries:
+  - DHT sensor library by Adafruit
+  - Adafruit Unified Sensor
+  - LiquidCrystal I2C
+  - ArduinoJson
+
+  Serial Monitor: 115200 baud
+
+  Commands:
+    HELP
+    STATUS
+    UPLOAD
+    LCD TEST
+    MOTOR ON 10
+    MOTOR OFF
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+// ========================================================
+// USER CONFIG — PASTE YOUR VALUES HERE BEFORE FLASHING
+// ========================================================
+
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// Example:
+// https://YOUR_PROJECT_REF.supabase.co/functions/v1/device-sensor-ingest
+const char* SENSOR_INGEST_URL = "";
+
+// Example:
+// https://YOUR_PROJECT_REF.supabase.co/functions/v1/device-relay-poll?device_id=esp32-field-001
+const char* RELAY_POLL_URL = "";
+
+// Optional. Keep empty if your Supabase functions are deployed with --no-verify-jwt.
+// NEVER put service_role key here.
+const char* SUPABASE_ANON_KEY = "";
+
+const char* DEVICE_ID = "esp32-field-001";
+const char* DEVICE_TOKEN = "change-this-device-token";
+
+// LCD I2C address. Most modules are 0x27. Some are 0x3F.
+#define LCD_ENABLED true
+#define LCD_ADDRESS 0x27
+
+// Relay modules are often active LOW.
+// If relay behavior is opposite, change to false.
+const bool RELAY_ACTIVE_LOW = true;
+
+// ========================================================
+// CAPACITIVE SOIL MOISTURE CALIBRATION
+// ========================================================
+
+// ESP32 ADC reads 0..4095.
+// Many capacitive soil sensors give:
+// - higher raw value when dry
+// - lower raw value when wet
+// You MUST calibrate using Serial Monitor.
+int SOIL_RAW_WET = 1300;  // update after testing in wet soil
+int SOIL_RAW_DRY = 3200;  // update after testing in dry soil/air
+
+// Powering capacitive sensor from GPIO25 is okay for this prototype.
+// If your sensor behaves unstable, connect VCC to 3.3V instead and keep GPIO25 unused.
+#define SOIL_SENSOR_TYPE "capacitive"
+
+// ========================================================
+// TIMING
+// ========================================================
+
+const unsigned long SENSOR_READ_INTERVAL_MS = 15000;   // 15 sec for testing
+const unsigned long UPLOAD_INTERVAL_MS = 60000;        // upload every 60 sec
+const unsigned long RELAY_POLL_INTERVAL_MS = 30000;    // poll relay command every 30 sec
+const unsigned long LCD_ROTATE_INTERVAL_MS = 3000;     // LCD page rotation
+
+// Relay safety
+const unsigned long MAX_MOTOR_ON_MS = 10UL * 60UL * 1000UL;   // 10 min max
+const unsigned long MOTOR_COOLDOWN_MS = 5UL * 60UL * 1000UL;  // 5 min cooldown
+
+// ========================================================
+// NPK / RS485 MODBUS SETTINGS
+// ========================================================
+
+// Set true only if you want fake NPK values for UI testing.
+#define USE_DUMMY_NPK false
+
+// Common settings for many low-cost RS485 NPK sensors.
+// If NPK read fails, check your sensor datasheet for ID/registers/baud.
+#define NPK_MODBUS_ID 1
+#define NPK_BAUD_RATE 9600
+#define NPK_REGISTER_START 0x001E
+#define NPK_REGISTER_COUNT 3
+
+// ========================================================
+// SAFE ESP32 PIN CONFIG
+// ========================================================
+
+#define DHT_PIN 4
+#define DHT_TYPE DHT11
+
+#define SOIL_POWER_PIN 25
+#define SOIL_ANALOG_PIN 34  // ADC1 input-only, WiFi-safe
+
+#define RELAY_PIN 26
+
+#define I2C_SDA_PIN 21
+#define I2C_SCL_PIN 22
+
+#define RS485_RX_PIN 32     // RS485 converter RO -> ESP32 RX
+#define RS485_TX_PIN 33     // RS485 converter DI <- ESP32 TX
+#define RS485_DE_RE_PIN 27  // RS485 converter DE and RE tied together
+
+// ========================================================
+// GLOBALS
+// ========================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
+
+struct SensorData {
+  float temperatureC = NAN;
+  float humidity = NAN;
+  int soilRaw = 0;
+  int soilPercent = 0;
+  int npkN = 0;
+  int npkP = 0;
+  int npkK = 0;
+  bool dhtOk = false;
+};
+
+SensorData current;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastUpload = 0;
+unsigned long lastRelayPoll = 0;
+unsigned long lastLcdRotate = 0;
+unsigned long motorStartedAt = 0;
+unsigned long lastMotorStoppedAt = 0;
+unsigned long motorPlannedOffAt = 0;
+
+bool motorOn = false;
+bool uploadNowRequested = false;
+bool npkOk = false;
+bool lcdOk = false;
+int lcdPage = 0;
+String lastStatus = "Booting";
+String lastRelayCommandId = "";
+
+// ========================================================
+// UTILS
+// ========================================================
+
+bool isConfigured(const char* value) {
+  return value != nullptr && strlen(value) > 0 && String(value).indexOf("YOUR_") == -1;
+}
+
+int clampInt(int value, int minValue, int maxValue) {
+  if (value < minValue) return minValue;
+  if (value > maxValue) return maxValue;
+  return value;
+}
+
+String soilStatus(int moisture) {
+  if (moisture < 30) return "DRY";
+  if (moisture > 70) return "WET";
+  return "OK";
+}
+
+void printLine(String line1, String line2) {
+#if LCD_ENABLED
+  if (!lcdOk) return;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1.substring(0, 16));
+  lcd.setCursor(0, 1);
+  lcd.print(line2.substring(0, 16));
+#endif
+}
+
+void setRelayHardware(bool on) {
+  // For active LOW relay: ON=LOW, OFF=HIGH. For active HIGH relay: ON=HIGH, OFF=LOW.
+  int level = RELAY_ACTIVE_LOW ? (on ? LOW : HIGH) : (on ? HIGH : LOW);
+  digitalWrite(RELAY_PIN, level);
+}
+
+// ========================================================
+// I2C / LCD
+// ========================================================
+
+bool i2cDeviceExists(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+void scanI2C() {
+  Serial.println("Scanning I2C bus...");
+  bool found = false;
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("I2C device found at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      found = true;
+    }
+  }
+  if (!found) Serial.println("No I2C device found. Check LCD SDA/SCL/VCC/GND.");
+}
+
+void initLcd() {
+#if LCD_ENABLED
+  scanI2C();
+  lcdOk = i2cDeviceExists(LCD_ADDRESS);
+  if (!lcdOk) {
+    Serial.print("LCD not found at 0x");
+    Serial.print(LCD_ADDRESS, HEX);
+    Serial.println(". If scanner showed 0x3F, change LCD_ADDRESS to 0x3F.");
+    return;
+  }
+  lcd.init();
+  lcd.backlight();
+  printLine("Smart Plant", "Booting...");
+  Serial.println("LCD initialized.");
+#else
+  lcdOk = false;
+#endif
+}
+
+// ========================================================
+// MOTOR CONTROL
+// ========================================================
+
+bool canStartMotor() {
+  if (motorOn) return true;
+  if (lastMotorStoppedAt == 0) return true;
+  return millis() - lastMotorStoppedAt >= MOTOR_COOLDOWN_MS;
+}
+
+bool startMotor(unsigned long durationSeconds, String reason) {
+  unsigned long durationMs = durationSeconds * 1000UL;
+  if (durationMs == 0) durationMs = 10000UL;
+  if (durationMs > MAX_MOTOR_ON_MS) durationMs = MAX_MOTOR_ON_MS;
+
+  if (!canStartMotor()) {
+    lastStatus = "Cooldown active";
+    Serial.println("MOTOR BLOCKED: cooldown active");
+    return false;
+  }
+
+  setRelayHardware(true);
+  motorOn = true;
+  uploadNowRequested = true; // immediately publish relay state to dashboard
+  motorStartedAt = millis();
+  motorPlannedOffAt = millis() + durationMs;
+  lastStatus = "Motor ON " + String(durationMs / 1000UL) + "s";
+
+  Serial.print("MOTOR ON for ");
+  Serial.print(durationMs / 1000UL);
+  Serial.print(" seconds. Reason: ");
+  Serial.println(reason);
+  return true;
+}
+
+void stopMotor(String reason) {
+  if (!motorOn) return;
+  setRelayHardware(false);
+  motorOn = false;
+  uploadNowRequested = true; // immediately publish relay state to dashboard
+  lastMotorStoppedAt = millis();
+  motorPlannedOffAt = 0;
+  lastStatus = "Motor OFF";
+  Serial.print("MOTOR OFF. Reason: ");
+  Serial.println(reason);
+}
+
+void handleMotorSafety() {
+  if (!motorOn) return;
+  unsigned long now = millis();
+  if (motorPlannedOffAt > 0 && now >= motorPlannedOffAt) {
+    stopMotor("planned duration finished");
+    return;
+  }
+  if (now - motorStartedAt >= MAX_MOTOR_ON_MS) {
+    stopMotor("max safety duration reached");
+  }
+}
+
+// ========================================================
+// SENSOR READING
+// ========================================================
+
+int readSoilRaw() {
+  digitalWrite(SOIL_POWER_PIN, HIGH);
+  delay(800); // capacitive sensors may need a short settling time
+
+  long total = 0;
+  const int samples = 12;
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(SOIL_ANALOG_PIN);
+    delay(20);
+  }
+
+  digitalWrite(SOIL_POWER_PIN, LOW);
+  return total / samples;
+}
+
+int soilRawToPercent(int raw) {
+  // dry -> 0%, wet -> 100%
+  int percent = map(raw, SOIL_RAW_DRY, SOIL_RAW_WET, 0, 100);
+  return clampInt(percent, 0, 100);
+}
+
+// ========================================================
+// RS485 MODBUS NPK
+// ========================================================
+
+uint16_t modbusCrc16(const uint8_t *buf, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t pos = 0; pos < len; pos++) {
+    crc ^= (uint16_t)buf[pos];
+    for (uint8_t i = 0; i < 8; i++) {
+      if (crc & 0x0001) {
+        crc >>= 1;
+        crc ^= 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+void rs485TransmitMode() {
+  digitalWrite(RS485_DE_RE_PIN, HIGH);
+  delayMicroseconds(200);
+}
+
+void rs485ReceiveMode() {
+  delayMicroseconds(200);
+  digitalWrite(RS485_DE_RE_PIN, LOW);
+}
+
+bool modbusReadHoldingRegisters(uint8_t slaveId, uint16_t startReg, uint16_t count, uint16_t *outRegs) {
+  while (Serial2.available()) Serial2.read();
+
+  uint8_t request[8];
+  request[0] = slaveId;
+  request[1] = 0x03;
+  request[2] = highByte(startReg);
+  request[3] = lowByte(startReg);
+  request[4] = highByte(count);
+  request[5] = lowByte(count);
+  uint16_t crc = modbusCrc16(request, 6);
+  request[6] = lowByte(crc);
+  request[7] = highByte(crc);
+
+  rs485TransmitMode();
+  Serial2.write(request, 8);
+  Serial2.flush();
+  rs485ReceiveMode();
+
+  const uint8_t expectedLen = 5 + (count * 2);
+  uint8_t response[64];
+  uint8_t idx = 0;
+  unsigned long start = millis();
+
+  while (millis() - start < 1200 && idx < expectedLen) {
+    if (Serial2.available()) response[idx++] = Serial2.read();
+  }
+
+  if (idx < expectedLen) {
+    Serial.println("NPK Modbus timeout / short response");
+    return false;
+  }
+
+  uint16_t receivedCrc = ((uint16_t)response[idx - 1] << 8) | response[idx - 2];
+  uint16_t calculatedCrc = modbusCrc16(response, idx - 2);
+  if (receivedCrc != calculatedCrc) {
+    Serial.println("NPK Modbus CRC failed");
+    return false;
+  }
+
+  if (response[0] != slaveId || response[1] != 0x03 || response[2] != count * 2) {
+    Serial.println("NPK Modbus invalid response");
+    return false;
+  }
+
+  for (uint16_t i = 0; i < count; i++) {
+    uint8_t base = 3 + (i * 2);
+    outRegs[i] = ((uint16_t)response[base] << 8) | response[base + 1];
+  }
+  return true;
+}
+
+void readNpk(int &n, int &p, int &k) {
+#if USE_DUMMY_NPK
+  unsigned long t = millis() / 10000UL;
+  n = 42 + (t % 5);
+  p = 18 + (t % 4);
+  k = 31 + (t % 6);
+  npkOk = true;
+#else
+  uint16_t regs[NPK_REGISTER_COUNT];
+  bool ok = modbusReadHoldingRegisters(NPK_MODBUS_ID, NPK_REGISTER_START, NPK_REGISTER_COUNT, regs);
+  if (ok) {
+    n = regs[0];
+    p = regs[1];
+    k = regs[2];
+    npkOk = true;
+  } else {
+    npkOk = false; // keep previous values
+  }
+#endif
+}
+
+void readSensors() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  current.dhtOk = !(isnan(h) || isnan(t));
+  if (current.dhtOk) {
+    current.humidity = h;
+    current.temperatureC = t;
+  }
+
+  current.soilRaw = readSoilRaw();
+  current.soilPercent = soilRawToPercent(current.soilRaw);
+
+  readNpk(current.npkN, current.npkP, current.npkK);
+
+  lastStatus = "Sensors updated";
+
+  Serial.println("\n--- SENSOR DATA ---");
+  Serial.print("DHT OK:        "); Serial.println(current.dhtOk ? "YES" : "NO");
+  Serial.print("Temperature C: "); Serial.println(current.temperatureC);
+  Serial.print("Humidity %:    "); Serial.println(current.humidity);
+  Serial.print("Soil type:     "); Serial.println(SOIL_SENSOR_TYPE);
+  Serial.print("Soil raw:      "); Serial.println(current.soilRaw);
+  Serial.print("Soil %:        "); Serial.println(current.soilPercent);
+  Serial.print("NPK OK:        "); Serial.println(npkOk ? "YES" : "NO");
+  Serial.print("NPK N/P/K:     ");
+  Serial.print(current.npkN); Serial.print("/");
+  Serial.print(current.npkP); Serial.print("/");
+  Serial.println(current.npkK);
+  Serial.print("Motor:         "); Serial.println(motorOn ? "ON" : "OFF");
+}
+
+// ========================================================
+// LCD DISPLAY
+// ========================================================
+
+void updateLcd() {
+  if (!lcdOk) return;
+
+  if (lcdPage == 0) {
+    String t = current.dhtOk ? String(current.temperatureC, 1) : "--";
+    String h = current.dhtOk ? String(current.humidity, 0) : "--";
+    printLine("T:" + t + "C H:" + h + "%", "Soil:" + String(current.soilPercent) + "% " + soilStatus(current.soilPercent));
+  } else if (lcdPage == 1) {
+    printLine("N:" + String(current.npkN) + " P:" + String(current.npkP) + " K:" + String(current.npkK), npkOk ? "NPK sensor OK" : "NPK read fail");
+  } else if (lcdPage == 2) {
+    printLine("Motor:" + String(motorOn ? "ON" : "OFF"), WiFi.isConnected() ? "WiFi connected" : "WiFi offline");
+  } else {
+    printLine("Smart Plant", lastStatus);
+  }
+
+  lcdPage = (lcdPage + 1) % 4;
+}
+
+// ========================================================
+// WIFI + HTTP
+// ========================================================
+
+void connectWifi() {
+  if (!isConfigured(WIFI_SSID) || !isConfigured(WIFI_PASSWORD)) {
+    Serial.println("WiFi not configured. Running local-only.");
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connection failed. Continuing offline.");
+  }
+}
+
+String buildSensorJson() {
+  StaticJsonDocument<640> doc;
+  doc["device_id"] = DEVICE_ID;
+
+  if (current.dhtOk) {
+    doc["temperature_c"] = current.temperatureC;
+    doc["humidity_percent"] = current.humidity;
+  } else {
+    doc["temperature_c"] = serialized("null");
+    doc["humidity_percent"] = serialized("null");
+  }
+
+  doc["soil_moisture_raw"] = current.soilRaw;
+  doc["soil_moisture_percent"] = current.soilPercent;
+  doc["soil_sensor_type"] = SOIL_SENSOR_TYPE;
+  doc["npk_n"] = current.npkN;
+  doc["npk_p"] = current.npkP;
+  doc["npk_k"] = current.npkK;
+  doc["npk_source"] = USE_DUMMY_NPK ? "dummy" : (npkOk ? "rs485_modbus" : "rs485_modbus_read_failed");
+  doc["relay_motor_on"] = motorOn;
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+bool httpPostJson(String url, String jsonBody) {
+  if (!WiFi.isConnected()) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-id", DEVICE_ID);
+  http.addHeader("x-device-token", DEVICE_TOKEN);
+  if (isConfigured(SUPABASE_ANON_KEY)) {
+    http.addHeader("apikey", SUPABASE_ANON_KEY);
+    http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
+  }
+
+  int code = http.POST(jsonBody);
+  String response = http.getString();
+  http.end();
+
+  Serial.print("POST "); Serial.print(url); Serial.print(" -> "); Serial.println(code);
+  if (response.length() > 0) Serial.println(response);
+  return code >= 200 && code < 300;
+}
+
+void uploadSensorData() {
+  if (!isConfigured(SENSOR_INGEST_URL)) {
+    Serial.println("Upload skipped: SENSOR_INGEST_URL not configured.");
+    return;
+  }
+  if (!WiFi.isConnected()) {
+    Serial.println("Upload skipped: WiFi not connected.");
+    return;
+  }
+
+  String json = buildSensorJson();
+  Serial.print("Uploading: ");
+  Serial.println(json);
+  bool ok = httpPostJson(SENSOR_INGEST_URL, json);
+  lastStatus = ok ? "Upload OK" : "Upload failed";
+}
+
+void pollRelayCommand() {
+  if (!isConfigured(RELAY_POLL_URL)) return;
+  if (!WiFi.isConnected()) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.begin(client, RELAY_POLL_URL);
+  http.addHeader("x-device-id", DEVICE_ID);
+  http.addHeader("x-device-token", DEVICE_TOKEN);
+  if (isConfigured(SUPABASE_ANON_KEY)) {
+    http.addHeader("apikey", SUPABASE_ANON_KEY);
+    http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
+  }
+
+  int code = http.GET();
+  String response = http.getString();
+  http.end();
+
+  Serial.print("Relay poll -> "); Serial.println(code);
+  if (response.length() > 0) Serial.println(response);
+
+  if (code < 200 || code >= 300 || response.length() == 0) return;
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, response);
+  if (err) {
+    Serial.println("Relay JSON parse failed");
+    return;
+  }
+
+  if (doc["command"].isNull()) return;
+
+  String commandId = doc["command"]["id"] | "";
+  String action = doc["command"]["action"] | "";
+  int duration = doc["command"]["duration_seconds"] | 10;
+
+  if (commandId.length() > 0 && commandId == lastRelayCommandId) return;
+
+  if (action == "on") {
+    bool started = startMotor(duration, "backend relay command");
+    if (started && commandId.length() > 0) lastRelayCommandId = commandId;
+  } else if (action == "off") {
+    stopMotor("backend relay command");
+    if (commandId.length() > 0) lastRelayCommandId = commandId;
+  }
+}
+
+// ========================================================
+// SERIAL COMMANDS
+// ========================================================
+
+void printHelp() {
+  Serial.println("\nCommands:");
+  Serial.println("  HELP        - show commands");
+  Serial.println("  STATUS      - print current JSON/status");
+  Serial.println("  UPLOAD      - force upload to Supabase");
+  Serial.println("  LCD TEST    - test LCD text");
+  Serial.println("  MOTOR ON 10 - relay ON for 10 seconds");
+  Serial.println("  MOTOR OFF   - relay OFF");
+}
+
+void handleSerialCommand() {
+  if (!Serial.available()) return;
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toUpperCase();
+
+  if (cmd == "HELP") {
+    printHelp();
+  } else if (cmd == "STATUS") {
+    Serial.println(buildSensorJson());
+    Serial.print("WiFi: "); Serial.println(WiFi.isConnected() ? "connected" : "offline");
+    Serial.print("LCD:  "); Serial.println(lcdOk ? "ok" : "not found");
+  } else if (cmd == "UPLOAD") {
+    uploadSensorData();
+  } else if (cmd == "LCD TEST") {
+    printLine("LCD Test OK", "Smart Plant");
+  } else if (cmd.startsWith("MOTOR ON")) {
+    int seconds = 10;
+    int lastSpace = cmd.lastIndexOf(' ');
+    if (lastSpace > 0) {
+      seconds = cmd.substring(lastSpace + 1).toInt();
+      if (seconds <= 0) seconds = 10;
+    }
+    startMotor(seconds, "serial command");
+  } else if (cmd == "MOTOR OFF") {
+    stopMotor("serial command");
+  } else {
+    Serial.print("Unknown command: ");
+    Serial.println(cmd);
+    printHelp();
+  }
+}
+
+// ========================================================
+// SETUP + LOOP
+// ========================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(SOIL_POWER_PIN, OUTPUT);
+  digitalWrite(SOIL_POWER_PIN, LOW);
+
+  // Set OFF level before enabling output to avoid relay boot glitch.
+  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+  pinMode(RELAY_PIN, OUTPUT);
+  setRelayHardware(false);
+
+  pinMode(RS485_DE_RE_PIN, OUTPUT);
+  digitalWrite(RS485_DE_RE_PIN, LOW);
+  Serial2.begin(NPK_BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  initLcd();
+
+  dht.begin();
+  analogReadResolution(12);
+  analogSetPinAttenuation(SOIL_ANALOG_PIN, ADC_11db);
+
+  connectWifi();
+
+  readSensors();
+  updateLcd();
+
+  Serial.println("Setup complete.");
+  printHelp();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  handleSerialCommand();
+  handleMotorSafety();
+
+  if (now - lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
+    lastSensorRead = now;
+    readSensors();
+  }
+
+  if (now - lastLcdRotate >= LCD_ROTATE_INTERVAL_MS) {
+    lastLcdRotate = now;
+    updateLcd();
+  }
+
+  if (uploadNowRequested || now - lastUpload >= UPLOAD_INTERVAL_MS) {
+    uploadNowRequested = false;
+    lastUpload = now;
+    uploadSensorData();
+  }
+
+  if (now - lastRelayPoll >= RELAY_POLL_INTERVAL_MS) {
+    lastRelayPoll = now;
+    pollRelayCommand();
+  }
+
+  delay(20);
+}
