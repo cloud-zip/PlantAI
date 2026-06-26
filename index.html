@@ -4,6 +4,122 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Plantify</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <!-- Google Fonts and Icons for Botanical Aesthetics -->
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400..900;1,400..900&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;700&family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0&display=swap" rel="stylesheet" />
+    <script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            "colors": {
+              "on-tertiary-fixed": "#191d16",
+              "inverse-on-surface": "#30312b",
+              "surface-container-high": "#292a25",
+              "tertiary": "#ffffff",
+              "on-secondary-container": "#b8b9b2",
+              "background": "#13140f",
+              "surface-container-highest": "#34352f",
+              "error": "#ffb4ab",
+              "tertiary-container": "#e1e4d8",
+              "surface-bright": "#393a34",
+              "surface-container-lowest": "#0d0f0a",
+              "secondary-container": "#484a45",
+              "primary-container": "#caf300",
+              "surface-tint": "#b0d500",
+              "tertiary-fixed-dim": "#c4c8bc",
+              "on-tertiary": "#2e322a",
+              "on-surface-variant": "#c5c9ac",
+              "on-error-container": "#ffdad6",
+              "outline": "#8f9378",
+              "surface": "#13140f",
+              "secondary-fixed": "#e3e3dc",
+              "outline-variant": "#444932",
+              "on-secondary-fixed-variant": "#464743",
+              "on-secondary": "#2f312d",
+              "surface-dim": "#13140f",
+              "primary": "#ffffff",
+              "on-primary-fixed-variant": "#3e4c00",
+              "tertiary-fixed": "#e1e4d8",
+              "on-tertiary-container": "#62665c",
+              "secondary": "#c6c7c0",
+              "surface-container-low": "#1b1c17",
+              "surface-variant": "#34352f",
+              "on-tertiary-fixed-variant": "#44483f",
+              "on-background": "#e4e3da",
+              "on-surface": "#e4e3da",
+              "on-secondary-fixed": "#1a1c18",
+              "inverse-surface": "#e4e3da",
+              "secondary-fixed-dim": "#c6c7c0",
+              "inverse-primary": "#536600",
+              "surface-container": "#1f201b",
+              "on-primary-fixed": "#171e00",
+              "error-container": "#93000a",
+              "primary-fixed": "#caf300",
+              "on-primary-container": "#596c00",
+              "on-primary": "#2a3400",
+              "on-error": "#690005",
+              "primary-fixed-dim": "#b0d500",
+              'plant-dark': '#13140f',
+              'plant-card': '#1c1e14',
+              'plant-lime': '#d4ff00',
+              'plant-yellow': '#e2f600',
+            },
+            "borderRadius": {
+              "DEFAULT": "1rem",
+              "lg": "2rem",
+              "xl": "3rem",
+              "full": "9999px"
+            },
+            "spacing": {
+              "stack-gap": "1rem",
+              "section-margin": "2rem",
+              "container-padding": "1.5rem",
+              "grid-gutter": "1rem"
+            },
+            "fontFamily": {
+              "data-unit": ["JetBrains Mono"],
+              "headline-md": ["Libre Caslon Text"],
+              "data-lg": ["Libre Caslon Text"],
+              "label-sm": ["JetBrains Mono"],
+              "body-md": ["Inter"],
+              "display-lg": ["Libre Caslon Text"],
+              "serif": ['"Playfair Display"', 'serif'],
+              "sans": ['Inter', 'sans-serif'],
+              "mono": ['"JetBrains Mono"', 'monospace'],
+            }
+          },
+        },
+      }
+    </script>
+    <style>
+      body {
+        background-color: #13140f;
+        color: #e4e3da;
+        font-family: 'Inter', sans-serif;
+      }
+      .serif-title {
+        font-family: 'Playfair Display', serif;
+      }
+      .mono-text {
+        font-family: 'JetBrains Mono', monospace;
+      }
+      ::-webkit-scrollbar {
+        display: none;
+      }
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        display: inline-block;
+      }
+      .glass-card {
+        background: rgba(28, 30, 20, 0.7);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
