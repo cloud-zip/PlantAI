@@ -16,7 +16,10 @@
     "@mui/material": "latest",
     "vite": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "three": "^0.160.0",
+    "@react-three/fiber": "^8.15.11",
+    "@react-three/drei": "^9.92.7"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "latest"
